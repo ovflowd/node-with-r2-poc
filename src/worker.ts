@@ -10,27 +10,37 @@ import {
 import responses from './responses';
 
 interface Worker {
-  async fetch: (r: Request, e: Env, c: ExecutionContext) => Promise<Response>;
+  /**
+   * Worker entrypoint
+   * @see https://developers.cloudflare.com/workers/runtime-apis/fetch-event/#syntax-es-modules
+   */
+  fetch: (r: Request, e: Env, c: ExecutionContext) => Promise<Response>;
 }
 
 const cloudflareWorker: Worker = {
-  async fetch = (request, env, ctx) => {
+  fetch: async (request, env, ctx) => {
     const cache = caches.default;
 
     const shouldServeCache = isCacheEnabled(env);
 
-    // Review: What about `OPTIONS` type?
     if (['GET', 'HEAD'].includes(request.method) === false) {
       // This endpoint is called from the sync script to purge
       //  directories that are commonly updated so we don't need to
       //  wait for the cache to expire
       if (
-        shouldServeCache && // <-- simplify this big if condition either by separating this condition to variables or smaller parts that are easier to read
-        env.PURGE_API_KEY !== undefined && // <-- shouldn't this always be defined?  what's the point of verifying this env var? Maybe this check should be inside cachePurgeHandler :)
+        shouldServeCache &&
         request.method === 'POST' &&
         request.url === '/_cf/cache-purge'
       ) {
         return cachePurgeHandler(request, cache, env);
+      }
+
+      if (request.method === 'OPTIONS') {
+        return new Response(undefined, {
+          headers: {
+            Allow: 'GET, HEAD, OPTIONS',
+          },
+        });
       }
 
       return responses.METHOD_NOT_ALLOWED;
@@ -47,7 +57,12 @@ const cloudflareWorker: Worker = {
       }
     }
 
-    const url = new URL(request.url); // <--- you should catch if URL is malformed. new URL can throw an Exception
+    let url: URL;
+    try {
+      url = new URL(request.url);
+    } catch (e) {
+      return new Response(undefined, { status: 400 });
+    }
 
     const bucketPath = mapUrlPathToBucketPath(url, env);
 
@@ -57,8 +72,6 @@ const cloudflareWorker: Worker = {
       return new Response('Unauthorized', { status: 401 });
     }
 
-    // Review: Not a good practice to assign a variable to two completely different things
-    const bucketComponents = decodeURIComponent(bucketPath);
     const isPathADirectory = isDirectoryPath(bucketPath);
 
     if (isPathADirectory && env.DIRECTORY_LISTING === 'off') {
@@ -67,11 +80,11 @@ const cloudflareWorker: Worker = {
       return responses.FILE_NOT_FOUND(request);
     }
 
-    const response: Response = isPathADirectory ?
-      // Directory requested, try listing it
-      await directoryHandler(url, request, bucketComponents, env) :
-      // File requested, try to serve it
-      await fileHandler(url, request, bucketComponents, env);
+    const response: Response = isPathADirectory
+      ? // Directory requested, try listing it
+        await directoryHandler(url, request, bucketPath, env)
+      : // File requested, try to serve it
+        await fileHandler(url, request, bucketPath, env);
 
     // Cache response if cache is enabled
     if (shouldServeCache && response.status !== 304) {
